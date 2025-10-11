@@ -1,5 +1,6 @@
 use crate::{OffsetUtf16, Point, PointUtf16, TextSummary, Unclipped};
 use arrayvec::ArrayString;
+use bitvec::prelude::*;
 use std::{cmp, ops::Range};
 use sum_tree::Bias;
 use unicode_segmentation::GraphemeCursor;
@@ -21,7 +22,11 @@ pub struct Chunk {
     /// than two UTF-16 code units.)
     chars_utf16: u128,
     /// If bit[i] is set, then the character at index i is an ascii newline.
-    newlines: u128,
+    ///
+    /// Only bits `0..text.len()` are valid.
+    // Note: This creates an array of usizes. It can't currently be u128 due to
+    // <https://github.com/ferrilab/bitvec/issues/76>
+    newlines: BitArr!(for MAX_BASE, in usize),
     /// If bit[i] is set, then the character at index i is an ascii tab.
     pub(crate) tabs: u128,
     pub text: ArrayString<MAX_BASE>,
@@ -42,7 +47,7 @@ impl Chunk {
             self.chars |= 1 << ix;
             self.chars_utf16 |= 1 << ix;
             self.chars_utf16 |= (c.len_utf16() as u128) << ix;
-            self.newlines |= ((c == '\n') as u128) << ix;
+            self.newlines.set(ix, c == '\n');
             self.tabs |= ((c == '\t') as u128) << ix;
         }
         self.text.push_str(text);
@@ -57,9 +62,10 @@ impl Chunk {
         let base_ix = self.text.len();
         self.chars |= slice.chars << base_ix;
         self.chars_utf16 |= slice.chars_utf16 << base_ix;
-        self.newlines |= slice.newlines << base_ix;
+        self.newlines[base_ix..] |= &slice.newlines;
         self.tabs |= slice.tabs << base_ix;
         self.text.push_str(slice.text);
+        debug_assert!(!self.newlines[self.text.len()..].any());
     }
 
     #[inline(always)]
@@ -88,7 +94,7 @@ impl Chunk {
 pub struct ChunkSlice<'a> {
     chars: u128,
     chars_utf16: u128,
-    newlines: u128,
+    newlines: BitArr!(for MAX_BASE, in usize),
     tabs: u128,
     text: &'a str,
 }
@@ -123,7 +129,7 @@ impl<'a> ChunkSlice<'a> {
             let right = ChunkSlice {
                 chars: 0,
                 chars_utf16: 0,
-                newlines: 0,
+                newlines: BitArray::ZERO,
                 tabs: 0,
                 text: "",
             };
@@ -134,14 +140,14 @@ impl<'a> ChunkSlice<'a> {
             let left = ChunkSlice {
                 chars: self.chars & mask,
                 chars_utf16: self.chars_utf16 & mask,
-                newlines: self.newlines & mask,
+                newlines: BitArray::ZERO | &self.newlines[..mid],
                 tabs: self.tabs & mask,
                 text: left_text,
             };
             let right = ChunkSlice {
                 chars: self.chars >> mid,
                 chars_utf16: self.chars_utf16 >> mid,
-                newlines: self.newlines >> mid,
+                newlines: BitArray::ZERO | &self.newlines[mid..],
                 tabs: self.tabs >> mid,
                 text: right_text,
             };
@@ -166,7 +172,7 @@ impl<'a> ChunkSlice<'a> {
             Self {
                 chars: 0,
                 chars_utf16: 0,
-                newlines: 0,
+                newlines: BitArray::ZERO,
                 tabs: 0,
                 text: "",
             }
@@ -180,7 +186,7 @@ impl<'a> ChunkSlice<'a> {
             Self {
                 chars: (self.chars & mask) >> range.start,
                 chars_utf16: (self.chars_utf16 & mask) >> range.start,
-                newlines: (self.newlines & mask) >> range.start,
+                newlines: BitArray::ZERO | &self.newlines[range.clone()],
                 tabs: (self.tabs & mask) >> range.start,
                 text: &self.text[range],
             }
@@ -216,21 +222,43 @@ impl<'a> ChunkSlice<'a> {
         OffsetUtf16(self.chars_utf16.count_ones() as usize)
     }
 
-    /// Get point representing number of lines and length of last line
+    /// Get point representing number of lines and length in bytes of last line
     #[inline(always)]
     pub fn lines(&self) -> Point {
+        debug_assert!(
+            !self.newlines[self.text.len()..].any(),
+            "newline bits are set after end of text"
+        );
         let row = self.newlines.count_ones();
-        let column = self.newlines.leading_zeros() - (u128::BITS - self.text.len() as u32);
-        Point::new(row, column)
+        let column = self.last_line_range().len();
+        Point::new(row as u32, column as u32)
+    }
+
+    /// Return the range of byte offsets after the last newline.
+    #[inline(always)]
+    fn last_line_range(&self) -> Range<usize> {
+        debug_assert!(
+            !self.newlines[self.text.len()..].any(),
+            "newline bits are set after end of text"
+        );
+        let len = self.text.len();
+        let line_start = self.newlines.iter_ones().last().map_or(0, |i| i + 1);
+        line_start..len
+    }
+
+    /// Return the length in bytes of the first line, not including the newline.
+    #[inline(always)]
+    fn first_line_bytes(&self) -> usize {
+        self.newlines[..self.text.len()].leading_zeros()
     }
 
     /// Get number of chars in first line
     #[inline(always)]
     pub fn first_line_chars(&self) -> u32 {
-        if self.newlines == 0 {
+        if !self.newlines.any() {
             self.chars.count_ones()
         } else {
-            let mask = (1u128 << self.newlines.trailing_zeros()) - 1;
+            let mask = (1u128 << self.first_line_bytes()) - 1;
             (self.chars & mask).count_ones()
         }
     }
@@ -238,10 +266,22 @@ impl<'a> ChunkSlice<'a> {
     /// Get number of chars in last line
     #[inline(always)]
     pub fn last_line_chars(&self) -> u32 {
-        if self.newlines == 0 {
+        if !self.newlines.any() {
             self.chars.count_ones()
         } else {
-            let mask = !(u128::MAX >> self.newlines.leading_zeros());
+            let last_line_bytes = self.last_line_range();
+            if last_line_bytes.is_empty() {
+                return 0;
+            }
+            // mask off everything before the start, i.e. keep the higher bits
+            // TODO: This is a good example of where testing with only small chunks
+            // misses a case that can happen in real use: this will panic if
+            // the last_line is 128 bytes long; it won't panic if MAX_BASE=6.
+            debug_assert!(
+                last_line_bytes.start < MAX_BASE,
+                "last_line_bytes {last_line_bytes:?} too large for {self:?}"
+            );
+            let mask = u128::MAX << last_line_bytes.start;
             (self.chars & mask).count_ones()
         }
     }
@@ -249,10 +289,18 @@ impl<'a> ChunkSlice<'a> {
     /// Get number of UTF-16 code units in last line
     #[inline(always)]
     pub fn last_line_len_utf16(&self) -> u32 {
-        if self.newlines == 0 {
+        if !self.newlines.any() {
             self.chars_utf16.count_ones()
         } else {
-            let mask = !(u128::MAX >> self.newlines.leading_zeros());
+            let last_line_bytes = self.last_line_range();
+            if last_line_bytes.is_empty() {
+                return 0;
+            }
+            debug_assert!(
+                last_line_bytes.start < MAX_BASE,
+                "last_line_bytes {last_line_bytes:?} too large for {self:?}"
+            );
+            let mask = u128::MAX << self.last_line_range().start;
             (self.chars_utf16 & mask).count_ones()
         }
     }
@@ -262,48 +310,52 @@ impl<'a> ChunkSlice<'a> {
     #[inline(always)]
     pub fn longest_row(&self, total_chars: &mut usize) -> (u32, u32) {
         let mut chars = self.chars;
-        let mut newlines = self.newlines;
+        let mut newlines = &self.newlines[..self.text.len()];
         *total_chars = 0;
         let mut row = 0;
         let mut longest_row = 0;
         let mut longest_row_chars = 0;
-        while newlines > 0 {
-            let newline_ix = newlines.trailing_zeros();
-            let row_chars = (chars & ((1 << newline_ix) - 1)).count_ones() as u8;
-            *total_chars += usize::from(row_chars);
+        while let Some(newline_ix) = newlines.iter_ones().next() {
+            let row_chars = (chars & ((1 << newline_ix) - 1)).count_ones();
+            *total_chars += row_chars as usize;
             if row_chars > longest_row_chars {
                 longest_row = row;
                 longest_row_chars = row_chars;
             }
 
-            newlines >>= newline_ix;
-            newlines >>= 1;
             chars >>= newline_ix;
             chars >>= 1;
             row += 1;
             *total_chars += 1;
+            if newline_ix + 1 >= newlines.len() {
+                break;
+            } else {
+                newlines = &newlines[newline_ix + 1..];
+            }
         }
 
-        let row_chars = chars.count_ones() as u8;
-        *total_chars += usize::from(row_chars);
+        let row_chars = chars.count_ones();
+        *total_chars += row_chars as usize;
         if row_chars > longest_row_chars {
-            (row, row_chars as u32)
+            (row, row_chars)
         } else {
             (longest_row, longest_row_chars as u32)
         }
     }
 
+    /// Translate a byte-indexed offset into a row/column point.
+    ///
+    /// If the offset is at a newline, the point is at the end of the line.
     #[inline(always)]
     pub fn offset_to_point(&self, offset: usize) -> Point {
-        let mask = if offset == MAX_BASE {
-            u128::MAX
+        let newlines = &self.newlines[..offset]; // don't include newline at offset
+        if let Some(newline_ix) = newlines.iter_ones().last() {
+            let row = newlines.count_ones();
+            let column = offset - newline_ix - 1; // can't underflow because we excluded newline at offset, so newline_ix < offset
+            Point::new(row as u32, column as u32)
         } else {
-            (1u128 << offset) - 1
-        };
-        let row = (self.newlines & mask).count_ones();
-        let newline_ix = u128::BITS - (self.newlines & mask).leading_zeros();
-        let column = (offset - newline_ix as usize) as u32;
-        Point::new(row, column)
+            Point::new(0, offset as u32)
+        }
     }
 
     #[inline(always)]
@@ -360,19 +412,29 @@ impl<'a> ChunkSlice<'a> {
 
     #[inline(always)]
     pub fn offset_to_point_utf16(&self, offset: usize) -> PointUtf16 {
+        // NB: This currently tolerates offset not being on a char boundary,
+        // but I'm not clear if that's desirable. -- @sourcefrog
         let mask = if offset == MAX_BASE {
             u128::MAX
         } else {
             (1u128 << offset) - 1
         };
-        let row = (self.newlines & mask).count_ones();
-        let newline_ix = u128::BITS - (self.newlines & mask).leading_zeros();
-        let column = if newline_ix as usize == MAX_BASE {
-            0
-        } else {
-            ((self.chars_utf16 & mask) >> newline_ix).count_ones()
-        };
-        PointUtf16::new(row, column)
+        debug_assert!(offset <= self.text.len());
+        // debug_assert!(
+        //     self.is_char_boundary(offset),
+        //     "Invalid offset {} in {:?}",
+        //     offset,
+        //     self.text
+        // );
+        let row = self.newlines[..offset].count_ones();
+        let line_start = self.newlines[..offset]
+            .iter_ones()
+            .last()
+            .map_or(0, |i| i + 1);
+        debug_assert!(line_start <= offset);
+        debug_assert!(line_start == 0 || self.text.as_bytes()[line_start - 1] == b'\n');
+        let column = ((self.chars_utf16 & mask) >> line_start).count_ones();
+        PointUtf16::new(row as u32, column)
     }
 
     #[inline(always)]
@@ -382,7 +444,7 @@ impl<'a> ChunkSlice<'a> {
 
     #[inline(always)]
     pub fn point_utf16_to_offset(&self, point: PointUtf16, clip: bool) -> usize {
-        let lines = self.lines();
+        let lines = self.lines(); // TODO: We don't need the last line length?
         if point.row > lines.row {
             if !clip {
                 debug_panic!(
@@ -393,15 +455,14 @@ impl<'a> ChunkSlice<'a> {
             }
             return self.len();
         }
-
         let row_offset_range = self.offset_range_for_row(point.row);
         let line = self.slice(row_offset_range.clone());
         if point.column > line.last_line_len_utf16() {
             if !clip {
                 debug_panic!(
-                    "point {:?} is beyond the end of the line in chunk {:?}",
-                    point,
-                    self.text
+                    "point {point:?} is beyond the end of the line in chunk {:?}, line {line:?}, last line len_utf16 {}, row_offset_range {row_offset_range:?}",
+                    self.text,
+                    line.last_line_len_utf16()
                 );
             }
             return line.len();
@@ -517,22 +578,25 @@ impl<'a> ChunkSlice<'a> {
         }
     }
 
+    /// Return the byte offset range for the given row.
+    ///
+    /// The range does not include the newline character.
     #[inline(always)]
     fn offset_range_for_row(&self, row: u32) -> Range<usize> {
+        let newlines = &self.newlines[..self.text.len()];
         let row_start = if row > 0 {
-            nth_set_bit(self.newlines, row as usize) + 1
+            newlines
+                .iter_ones()
+                .nth((row - 1) as usize)
+                .expect("row out of range")
+                + 1
         } else {
             0
         };
-        let row_len = if row_start == MAX_BASE {
-            0
-        } else {
-            cmp::min(
-                (self.newlines >> row_start).trailing_zeros(),
-                (self.text.len() - row_start) as u32,
-            )
-        };
-        row_start..row_start + row_len as usize
+        let row_len = newlines[row_start..].leading_zeros() as u32;
+        let range = row_start..row_start + row_len as usize;
+        debug_assert!(!self.newlines[range.clone()].any());
+        range
     }
 
     #[inline(always)]
@@ -758,11 +822,23 @@ mod tests {
         log::info!("Verifying chunk {:?}", text);
         assert_eq!(chunk.offset_to_point(0), Point::zero());
 
+        assert_eq!(
+            text.char_indices()
+                .filter(|(_i, c)| *c == '\n')
+                .map(|(i, _)| i)
+                .collect::<Vec<usize>>(),
+            chunk.newlines.iter_ones().collect::<Vec<usize>>(),
+            "newline bits do not match in {text:?} and chunk {chunk:?}"
+        );
+
         let mut expected_tab_positions = Vec::new();
 
         for (char_offset, c) in text.chars().enumerate() {
-            let expected_point = chunk.offset_to_point(offset);
-            assert_eq!(point, expected_point, "mismatch at offset {}", offset);
+            assert_eq!(
+                chunk.offset_to_point(offset),
+                point,
+                "wrong offset_to_point mismatch at offset {offset:?} in {text:?} and chunk {chunk:?}"
+            );
             assert_eq!(
                 chunk.point_to_offset(point),
                 offset,
@@ -890,7 +966,10 @@ mod tests {
         }
 
         let final_point = chunk.offset_to_point(offset);
-        assert_eq!(point, final_point, "mismatch at final offset {}", offset);
+        assert_eq!(
+            point, final_point,
+            "mismatch at final offset {offset} in {chunk:?} in {text:?}"
+        );
         assert_eq!(
             chunk.point_to_offset(point),
             offset,
@@ -983,7 +1062,11 @@ mod tests {
                 last_line_len += c.len_utf8() as u32;
             }
         }
-        assert_eq!(lines, Point::new(newline_count, last_line_len));
+        assert_eq!(
+            lines,
+            Point::new(newline_count, last_line_len),
+            "Counted the wrong number of lines in {text:?}"
+        );
 
         // Verify first/last line chars
         if !text.is_empty() {
@@ -991,10 +1074,15 @@ mod tests {
             assert_eq!(chunk.first_line_chars(), first_line.chars().count() as u32);
 
             let last_line = text.split('\n').next_back().unwrap();
-            assert_eq!(chunk.last_line_chars(), last_line.chars().count() as u32);
+            assert_eq!(
+                chunk.last_line_chars(),
+                last_line.chars().count() as u32,
+                "wrong number of last_line_chars for {text:?}",
+            );
             assert_eq!(
                 chunk.last_line_len_utf16(),
-                last_line.chars().map(|c| c.len_utf16() as u32).sum::<u32>()
+                last_line.chars().map(|c| c.len_utf16() as u32).sum::<u32>(),
+                "wrong number of last line UTF-16 code units for {text:?}",
             );
         }
 
@@ -1023,8 +1111,33 @@ mod tests {
             max_row = current_row;
         }
 
-        assert_eq!((max_row, max_chars as u32), (longest_row, longest_chars));
-        assert_eq!(chunk.tabs().collect::<Vec<_>>(), expected_tab_positions);
+        assert_eq!(
+            (max_row, max_chars as u32),
+            (longest_row, longest_chars),
+            "wrong longest row for {text:?}"
+        );
+        assert_eq!(
+            chunk.tabs().collect::<Vec<_>>(),
+            expected_tab_positions,
+            "wrong tab positions for {text:?}"
+        );
+    }
+
+    #[test]
+    fn last_line_range() {
+        let chunk = Chunk::new("");
+        assert!(chunk.as_slice().last_line_range().is_empty());
+
+        let chunk = Chunk::new("hello");
+        assert_eq!(chunk.as_slice().last_line_range(), 0..5);
+
+        let chunk = Chunk::new("hello\nworld");
+        assert_eq!(chunk.as_slice().last_line_range(), 6..11);
+
+        let chunk = Chunk::new("hello\nworld\n");
+        assert_eq!(chunk.as_slice().last_line_range(), 12..12);
+    }
+
     #[test]
     fn unaligned_offset_to_utf8_point() {
         // This tests behavior relied upon by diagnostic_tests.rs, although accepting

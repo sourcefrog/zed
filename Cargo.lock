@@ -13319,6 +13319,7 @@ name = "rope"
 version = "0.1.0"
 dependencies = [
  "arrayvec",
+ "bitvec",
  "criterion",
  "ctor",
  "gpui",

@@ -13,6 +13,7 @@ path = "src/rope.rs"
 
 [dependencies]
 arrayvec = "0.7.1"
+bitvec.workspace = true
 log.workspace = true
 rayon.workspace = true
 smallvec.workspace = true
