@@ -1025,5 +1025,15 @@ mod tests {
 
         assert_eq!((max_row, max_chars as u32), (longest_row, longest_chars));
         assert_eq!(chunk.tabs().collect::<Vec<_>>(), expected_tab_positions);
+    #[test]
+    fn unaligned_offset_to_utf8_point() {
+        // This tests behavior relied upon by diagnostic_tests.rs, although accepting
+        // offsets not on char boundaries seems inconsistent with the rest of the API.
+        let chunk = Chunk::new("a𐍈b");
+        for offset in 0..=chunk.text.len() {
+            let point = chunk.as_slice().offset_to_point_utf16(offset);
+            println!("offset {offset} -> point {point:?}");
+            // just check that it doesn't panic: it may not round trip precisely
+        }
     }
 }
