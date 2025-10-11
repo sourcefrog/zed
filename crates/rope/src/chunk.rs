@@ -23,7 +23,7 @@ pub struct Chunk {
     /// If bit[i] is set, then the character at index i is an ascii newline.
     newlines: u128,
     /// If bit[i] is set, then the character at index i is an ascii tab.
-    pub tabs: u128,
+    pub(crate) tabs: u128,
     pub text: ArrayString<MAX_BASE>,
 }
 
